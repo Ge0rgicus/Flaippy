@@ -40,8 +40,13 @@ def load_best_net():
 
 AI_NET = load_best_net()
 
+# Training constants — must match Flappy_env.py exactly
+TRAIN_W, TRAIN_H, TRAIN_GAP = 420, 640, 148
+TRAIN_MAX_FALL = 11.0
+
 def ai_decide(net, bird_y, bird_vel, pipes):
-    """Return 1 = flap, 0 = do nothing. Same observation as training."""
+    """Return 1 = flap, 0 = do nothing.
+    Normalise with the TRAINING constants so the net sees what it expects."""
     next_pipe = None
     for p in pipes:
         if p["x"] + PIPE_W > BIRD_X:
@@ -50,10 +55,10 @@ def ai_decide(net, bird_y, bird_vel, pipes):
     if next_pipe is None:
         dx, gap_top, gap_bot = 1.0, 0.5, 0.5
     else:
-        dx      = (next_pipe["x"] - BIRD_X) / GW
-        gap_top = next_pipe["h"] / GH
-        gap_bot = (next_pipe["h"] + GAP) / GH
-    obs = np.array([bird_y / GH, bird_vel / MAX_FALL, dx, gap_top, gap_bot],
+        dx      = (next_pipe["x"] - BIRD_X) / TRAIN_W
+        gap_top = next_pipe["h"] / TRAIN_H
+        gap_bot = (next_pipe["h"] + TRAIN_GAP) / TRAIN_H
+    obs = np.array([bird_y / TRAIN_H, bird_vel / TRAIN_MAX_FALL, dx, gap_top, gap_bot],
                    dtype=np.float32)
     return decide(net, obs)
 
@@ -302,6 +307,8 @@ def lobby_screen(screen, clock, fonts, ai_armed):
         screen.blit(t, t.get_rect(center=(W//2, 80)))
         sub = small.render("NEUROEVOLUTION EDITION", True, C_CYAN)
         screen.blit(sub, sub.get_rect(center=(W//2, 118)))
+        ip_s = small.render(f"Your IP:  {local_ip}", True, (110,110,150))
+        screen.blit(ip_s, ip_s.get_rect(center=(W//2, 148)))
 
         # AI armed indicator — tiny, bottom-left corner, your eyes only
         if ai_armed:
@@ -388,13 +395,77 @@ def lobby_screen(screen, clock, fonts, ai_armed):
 # ════════════════════════════════════════════════════════════════════════════
 def game_loop(screen, clock, fonts, peer, seed, role, ai_mode):
     """
-    ai_mode: if True the AI controls your bird this entire round.
-    Pipes are driven by a shared tick counter — both clients stay in sync.
+    Outer shell: runs rounds in a loop on the same connection until lobby/quit.
+    Rematch never disconnects — host picks new seed, both sides reset in place.
+    """
+    big, med, small = fonts
+    score_font = pygame.font.SysFont("couriernew", 32, bold=True)
+    ai_font    = pygame.font.SysFont("couriernew", 13, bold=True)
+    left_surf  = pygame.Surface((GW, GH))
+    right_surf = pygame.Surface((GW, GH))
+
+    current_seed = seed
+    current_ai   = ai_mode
+
+    while True:
+        action = _round(screen, clock, fonts, score_font, ai_font,
+                        left_surf, right_surf, peer, current_seed, role, current_ai)
+        if action == "lobby":
+            peer.close()
+            return "lobby"
+        if action == "quit":
+            peer.close()
+            pygame.quit(); sys.exit()
+
+        # ── REMATCH handshake ───────────────────────────────────────────────
+        # Both press R -> both send want_rematch.
+        # Host waits to receive it, then sends new_round with new seed.
+        # Guest waits to receive new_round. Both then loop back to _round.
+        W, H = screen.get_size()
+        peer.send({"type": "want_rematch"})
+        they_want = False
+        waiting   = True
+
+        while waiting:
+            clock.tick(60)
+            screen.fill(C_BG)
+            msg_text = "Waiting for opponent..." if not they_want else "Starting!"
+            t  = big.render("REMATCH?", True, C_YELLOW)
+            s  = small.render(msg_text, True, C_CYAN)
+            s2 = small.render("ESC - Lobby", True, (100,100,140))
+            screen.blit(t,  t.get_rect(center=(W//2, H//2 - 60)))
+            screen.blit(s,  s.get_rect(center=(W//2, H//2)))
+            screen.blit(s2, s2.get_rect(center=(W//2, H//2 + 40)))
+            pygame.display.flip()
+
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
+                    peer.close(); pygame.quit(); sys.exit()
+                if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+                    peer.close(); return "lobby"
+
+            for msg in peer.poll():
+                if msg.get("type") == "want_rematch":
+                    they_want = True
+                    if role == "host":
+                        current_seed = random.randint(0, 10**9)
+                        peer.send({"type": "new_round", "seed": current_seed})
+                        waiting = False
+                elif msg.get("type") == "new_round":
+                    current_seed = msg["seed"]
+                    waiting = False
+
+            if not peer.connected:
+                return "lobby"
+
+
+def _round(screen, clock, fonts, score_font, ai_font,
+           left_surf, right_surf, peer, seed, role, ai_mode):
+    """
+    Runs a single round. Returns 'rematch', 'lobby', or 'quit'.
     """
     big, med, small = fonts
     W, H = screen.get_size()
-    score_font = pygame.font.SysFont("couriernew", 32, bold=True)
-    ai_font    = pygame.font.SysFont("couriernew", 13, bold=True)
 
     # Same seed + same tick → identical pipe sequence on both machines
     my_pipes  = PipeGen(seed)
@@ -407,7 +478,7 @@ def game_loop(screen, clock, fonts, peer, seed, role, ai_mode):
     my_sc    = 0
     my_alive = True
     my_flap  = 0
-    my_scored_xs = set()   # pipe x-buckets already scored
+    my_scored_xs = set()
 
     # opponent bird (visual mirror, driven by network events)
     opp_y    = GH / 2 - 40
@@ -421,9 +492,6 @@ def game_loop(screen, clock, fonts, peer, seed, role, ai_mode):
     game_over   = False
     result_text = ""
     last_net_t  = time.time()
-
-    left_surf  = pygame.Surface((GW, GH))
-    right_surf = pygame.Surface((GW, GH))
 
     def do_flap():
         nonlocal my_vel, my_flap
@@ -447,7 +515,7 @@ def game_loop(screen, clock, fonts, peer, seed, role, ai_mode):
         # ── events ─────────────────────────────────────────────────────────
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
-                peer.close(); pygame.quit(); sys.exit()
+                return "quit"
             if event.type == pygame.KEYDOWN:
                 if event.key in (pygame.K_SPACE, pygame.K_w, pygame.K_UP):
                     if my_alive and not ai_mode:
@@ -464,8 +532,6 @@ def game_loop(screen, clock, fonts, peer, seed, role, ai_mode):
             elif t == "dead":
                 opp_alive = False
                 opp_sc    = msg.get("score", opp_sc)
-            elif t in ("rematch", "start"):
-                return "rematch"
 
         if not peer.connected and not game_over:
             result_text = "OPPONENT DISCONNECTED"
@@ -491,11 +557,10 @@ def game_loop(screen, clock, fonts, peer, seed, role, ai_mode):
             my_y    += my_vel
             my_flap += 1
 
-            # score — bucket by spawn position to avoid double-counting
+            # score — same logic as original Flappy_env.py
             for p in my_pipes.pipes:
-                bucket = round(p["x"] / 5)
-                if bucket not in my_scored_xs and p["x"] + PIPE_W < BIRD_X:
-                    my_scored_xs.add(bucket)
+                if not p.get("scored") and p["x"] < BIRD_X:
+                    p["scored"] = True
                     my_sc += 1
                     peer.send({"type": "score", "v": my_sc})
 
@@ -515,12 +580,19 @@ def game_loop(screen, clock, fonts, peer, seed, role, ai_mode):
             peer.send({"type": "state", "y": round(my_y, 1), "vel": round(my_vel, 2)})
             last_net_t = now
 
-        # ── game over check ──────────────────────────────────────────────────
-        if not my_alive and not opp_alive and not game_over:
+        # ── game over: show result as soon as either player dies ───────────
+        if (not my_alive or not opp_alive) and not game_over:
             game_over = True
-            if   my_sc > opp_sc: result_text = f"YOU WIN!   {my_sc} - {opp_sc}"
-            elif opp_sc > my_sc: result_text = f"YOU LOSE   {my_sc} - {opp_sc}"
-            else:                result_text = f"DRAW!      {my_sc} - {opp_sc}"
+            if not my_alive and opp_alive:
+                result_text = f"YOU LOSE   {my_sc} - {opp_sc}"
+            elif my_alive and not opp_alive:
+                result_text = f"YOU WIN!   {my_sc} - {opp_sc}"
+            elif my_sc > opp_sc:
+                result_text = f"YOU WIN!   {my_sc} - {opp_sc}"
+            elif opp_sc > my_sc:
+                result_text = f"YOU LOSE   {my_sc} - {opp_sc}"
+            else:
+                result_text = f"DRAW!      {my_sc} - {opp_sc}"
 
         # ══════════════════════════════════════════════════════════════════
         #  DRAW
@@ -571,13 +643,12 @@ def game_loop(screen, clock, fonts, peer, seed, role, ai_mode):
             screen.blit(rt, rt.get_rect(center=(W//2, H//2 - 50)))
             rb = med.render("R  →  Rematch        ESC  →  Lobby", True, C_CYAN)
             screen.blit(rb, rb.get_rect(center=(W//2, H//2 + 10)))
-            keys = pygame.key.get_pressed()
-            if keys[pygame.K_r]:
-                peer.send({"type": "rematch"})
-                return "rematch"
-            if keys[pygame.K_ESCAPE]:
-                peer.close()
-                return "lobby"
+            # use event-based input so a held key doesn't fire instantly
+            for ev in pygame.event.get(pygame.KEYDOWN):
+                if ev.key == pygame.K_r:
+                    return "rematch"
+                if ev.key == pygame.K_ESCAPE:
+                    return "lobby"
 
         pygame.display.flip()
 
@@ -620,18 +691,8 @@ def main():
             break
         peer, seed, role, ai_armed = result
 
-        action = game_loop(screen, clock, fonts, peer, seed, role, ai_armed)
-
-        while action == "rematch":
-            # go back to lobby so AI can be re-armed or disarmed for next round
-            result = lobby_screen(screen, clock, fonts, ai_armed)
-            if result is None:
-                peer.close(); break
-            peer, seed, role, ai_armed = result
-            action = game_loop(screen, clock, fonts, peer, seed, role, ai_armed)
-
-        if action == "lobby":
-            peer.close()
+        # game_loop handles all rematches internally, returns only on lobby/quit
+        game_loop(screen, clock, fonts, peer, seed, role, ai_armed)
 
     pygame.quit()
 
