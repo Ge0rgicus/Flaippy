@@ -99,6 +99,10 @@ C_DARK  = ( 30,  30,  60)
 # ════════════════════════════════════════════════════════════════════════════
 #  NETWORKING  (line-delimited JSON over TCP)
 # ════════════════════════════════════════════════════════════════════════════
+# ── Relay server address — change this after you deploy ─────────────────────
+RELAY_HOST = "flappy1v1.up.railway.app"   # <-- put your deployed URL here
+RELAY_PORT = 55201
+
 class NetPeer:
     def __init__(self):
         self.sock      = None
@@ -106,54 +110,67 @@ class NetPeer:
         self._buf      = b""
         self._lock     = threading.Lock()
         self._inbox    = []
+        self.room_code = None
+
+    def _connect_to_relay(self, status_cb):
+        """Open a TCP connection to the relay server."""
+        for attempt in range(10):
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.settimeout(8)
+                s.connect((RELAY_HOST, RELAY_PORT))
+                s.settimeout(None)
+                self.sock = s
+                return True
+            except Exception as e:
+                status_cb(f"Connecting to relay... ({attempt+1}/10)")
+                time.sleep(1)
+        status_cb("Could not reach relay server.\nCheck RELAY_HOST in the code.")
+        return False
 
     def host(self, status_cb):
         def _run():
-            srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            srv.bind(("", PORT))
-            srv.listen(1)
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                s.connect(("8.8.8.8", 80))
-                ip = s.getsockname()[0]; s.close()
-            except Exception:
-                ip = "your IP"
-            status_cb(f"Your IP:  {ip}\nWaiting for opponent...")
-            srv.settimeout(300)
-            try:
-                conn, addr = srv.accept()
-                self.sock = conn
-                self.connected = True
-                status_cb(f"Opponent connected from {addr[0]}!")
-                self._recv_loop()
-            except socket.timeout:
-                status_cb("Timed out. Restart to try again.")
-            finally:
-                try: srv.close()
-                except: pass
-        threading.Thread(target=_run, daemon=True).start()
-
-    def join(self, ip, status_cb):
-        def _run():
-            for attempt in range(15):
-                try:
-                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    s.settimeout(5)
-                    s.connect((ip.strip(), PORT))
-                    self.sock = s
+            status_cb("Connecting to relay server...")
+            if not self._connect_to_relay(status_cb):
+                return
+            self._send_raw({"type": "host"})
+            # wait for "hosted" message to get the room code
+            for msg in self._recv_iter():
+                if msg.get("type") == "hosted":
+                    self.room_code = msg["code"]
+                    status_cb(f"Room code:  {msg['code']}\nShare this with your friend!")
                     self.connected = True
-                    status_cb("Connected!")
-                    self._recv_loop()
-                    return
-                except Exception as e:
-                    status_cb(f"Attempt {attempt+1}/15... ({e})")
-                    time.sleep(1)
-            status_cb("Could not connect. Check the IP and try again.")
+                    # keep reading into inbox
+                    for m in self._recv_iter():
+                        with self._lock:
+                            self._inbox.append(m)
+                    break
+            self.connected = False
         threading.Thread(target=_run, daemon=True).start()
 
-    def _recv_loop(self):
-        self.sock.settimeout(None)
+    def join(self, code, status_cb):
+        def _run():
+            status_cb("Connecting to relay server...")
+            if not self._connect_to_relay(status_cb):
+                return
+            self._send_raw({"type": "join", "code": code.upper().strip()})
+            for msg in self._recv_iter():
+                t = msg.get("type")
+                if t == "error":
+                    status_cb(f"Error: {msg.get('msg')}")
+                    return
+                if t == "joined":
+                    status_cb("Joined! Waiting for host to start...")
+                    self.connected = True
+                    for m in self._recv_iter():
+                        with self._lock:
+                            self._inbox.append(m)
+                    break
+            self.connected = False
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _recv_iter(self):
+        """Yield parsed messages from socket."""
         try:
             while True:
                 chunk = self.sock.recv(4096)
@@ -163,13 +180,17 @@ class NetPeer:
                 while b"\n" in self._buf:
                     line, self._buf = self._buf.split(b"\n", 1)
                     try:
-                        with self._lock:
-                            self._inbox.append(json.loads(line.decode()))
-                    except Exception:
+                        yield json.loads(line.decode())
+                    except:
                         pass
-        except Exception:
+        except:
             pass
-        self.connected = False
+
+    def _send_raw(self, msg):
+        try:
+            self.sock.sendall((json.dumps(msg) + "\n").encode())
+        except:
+            pass
 
     def send(self, msg):
         if not self.connected:
@@ -275,26 +296,21 @@ def draw_bird(surf, x, y, vel, flap_tick, color):
 def lobby_screen(screen, clock, fonts, ai_armed):
     """
     Returns (peer, seed, role, ai_armed) when both players are connected.
-    ai_armed: persists between calls so rematch carries the same AI state.
-    Secret toggle: type KONAMI or Ctrl+Shift+A → arms/disarms AI for next round.
+    Uses relay server — just share a 5-letter room code.
+    Secret toggle: type KONAMI or Ctrl+Shift+A → arms/disarms AI.
     """
     big, med, small = fonts
     W, H = screen.get_size()
 
-    status   = ""
-    peer     = None
-    mode     = None
-    ip_input = ""
-    ip_focus = False
-    konami   = ""
+    status    = ""
+    peer      = None
+    mode      = None       # 'host' | 'join'
+    code_input= ""
+    code_focus= False
+    konami    = ""
+    connecting= False
 
-    host_rect = join_rect = ip_box_rect = connect_rect = pygame.Rect(0,0,0,0)
-
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80)); local_ip = s.getsockname()[0]; s.close()
-    except Exception:
-        local_ip = "unknown"
+    host_rect = join_rect = code_box_rect = connect_rect = pygame.Rect(0,0,0,0)
 
     def set_status(s): nonlocal status; status = s
 
@@ -307,10 +323,8 @@ def lobby_screen(screen, clock, fonts, ai_armed):
         screen.blit(t, t.get_rect(center=(W//2, 80)))
         sub = small.render("NEUROEVOLUTION EDITION", True, C_CYAN)
         screen.blit(sub, sub.get_rect(center=(W//2, 118)))
-        ip_s = small.render(f"Your IP:  {local_ip}", True, (110,110,150))
-        screen.blit(ip_s, ip_s.get_rect(center=(W//2, 148)))
 
-        # AI armed indicator — tiny, bottom-left corner, your eyes only
+        # AI armed indicator — bottom left, your eyes only
         if ai_armed:
             ab = small.render("[ AI ARMED ]", True, C_GREEN)
             screen.blit(ab, (12, H - 26))
@@ -320,7 +334,7 @@ def lobby_screen(screen, clock, fonts, ai_armed):
                 pygame.quit(); sys.exit()
 
             if event.type == pygame.KEYDOWN:
-                # secret toggle
+                # secret AI toggle
                 if event.unicode:
                     konami = (konami + event.unicode.upper())[-6:]
                     if konami == "KONAMI":
@@ -330,15 +344,17 @@ def lobby_screen(screen, clock, fonts, ai_armed):
                     ai_armed = not ai_armed
 
                 if event.key == pygame.K_ESCAPE:
-                    mode = None; peer = None; ip_input = ""; status = ""; ip_focus = False
+                    mode = None; peer = None; code_input = ""
+                    status = ""; code_focus = False; connecting = False
 
-                if ip_focus:
+                if code_focus:
                     if event.key == pygame.K_BACKSPACE:
-                        ip_input = ip_input[:-1]
-                    elif event.key == pygame.K_RETURN and ip_input:
-                        peer.join(ip_input, set_status); ip_focus = False
-                    elif event.unicode and event.unicode.isprintable() and len(ip_input) < 21:
-                        ip_input += event.unicode
+                        code_input = code_input[:-1]
+                    elif event.key == pygame.K_RETURN and code_input and not connecting:
+                        connecting = True
+                        peer.join(code_input, set_status)
+                    elif event.unicode and event.unicode.isalnum() and len(code_input) < 5:
+                        code_input = (code_input + event.unicode).upper()
 
             if event.type == pygame.MOUSEBUTTONDOWN:
                 mx, my = event.pos
@@ -346,47 +362,55 @@ def lobby_screen(screen, clock, fonts, ai_armed):
                     if host_rect.collidepoint(mx, my):
                         mode = "host"; peer = NetPeer(); peer.host(set_status)
                     if join_rect.collidepoint(mx, my):
-                        mode = "join"; peer = NetPeer(); ip_focus = True
+                        mode = "join"; peer = NetPeer(); code_focus = True
                 elif mode == "join":
-                    ip_focus = ip_box_rect.collidepoint(mx, my)
-                    if connect_rect.collidepoint(mx, my) and ip_input:
-                        peer.join(ip_input, set_status); ip_focus = False
+                    code_focus = code_box_rect.collidepoint(mx, my)
+                    if connect_rect.collidepoint(mx, my) and code_input and not connecting:
+                        connecting = True
+                        peer.join(code_input, set_status)
 
-        # panels
+        # ── panels ─────────────────────────────────────────────────────────
         if mode is None:
-            host_rect = _btn(screen, med, "HOST GAME", W//2 - 195, 210, C_YELLOW)
-            join_rect = _btn(screen, med, "JOIN GAME", W//2 + 15,  210, C_PINK)
-            _hint(screen, small, "HOST: share your IP with your friend", W//2, 295)
-            _hint(screen, small, "JOIN: enter the host's IP address",    W//2, 318)
+            host_rect = _btn(screen, med, "HOST GAME", W//2 - 195, 200, C_YELLOW)
+            join_rect = _btn(screen, med, "JOIN GAME", W//2 + 15,  200, C_PINK)
+            _hint(screen, small, "HOST: get a code and share it", W//2, 280)
+            _hint(screen, small, "JOIN: enter the host's code",   W//2, 303)
 
         elif mode == "host":
-            _hint(screen, small, "Share this IP with your friend:", W//2, 205)
-            ip_surf = med.render(local_ip, True, C_GREEN)
-            screen.blit(ip_surf, ip_surf.get_rect(center=(W//2, 240)))
+            # show room code once relay assigns one
+            if peer and peer.room_code:
+                _hint(screen, small, "Share this code with your friend:", W//2, 190)
+                code_surf = big.render(peer.room_code, True, C_GREEN)
+                screen.blit(code_surf, code_surf.get_rect(center=(W//2, 235)))
+                _hint(screen, small, "Waiting for them to join...", W//2, 285)
+            else:
+                _hint(screen, small, "Connecting to relay server...", W//2, 235)
 
         elif mode == "join":
-            _hint(screen, small, "Enter host IP address:", W//2, 205)
-            ip_box_rect = pygame.Rect(W//2 - 155, 228, 230, 38)
-            pygame.draw.rect(screen, C_DARK, ip_box_rect, border_radius=4)
-            pygame.draw.rect(screen, C_CYAN if ip_focus else (60,60,90),
-                             ip_box_rect, 2, border_radius=4)
-            it = med.render(ip_input + ("|" if ip_focus else ""), True, C_WHITE)
-            screen.blit(it, it.get_rect(midleft=(ip_box_rect.x+8, ip_box_rect.centery)))
-            connect_rect = _btn(screen, med, "CONNECT", W//2 + 85, 231, C_CYAN)
+            _hint(screen, small, "Enter the 5-letter room code:", W//2, 195)
+            code_box_rect = pygame.Rect(W//2 - 100, 220, 140, 46)
+            pygame.draw.rect(screen, C_DARK, code_box_rect, border_radius=6)
+            pygame.draw.rect(screen, C_CYAN if code_focus else (60,60,90),
+                             code_box_rect, 2, border_radius=6)
+            # big centered code text
+            ct = big.render(code_input + ("_" if code_focus and len(code_input) < 5 else ""), True, C_WHITE)
+            screen.blit(ct, ct.get_rect(center=code_box_rect.center))
+            if not connecting:
+                connect_rect = _btn(screen, med, "JOIN", W//2 - 30, 280, C_CYAN)
 
+        # status lines
         for i, line in enumerate(status.split("\n")):
             s = small.render(line, True, (180,180,220))
-            screen.blit(s, s.get_rect(center=(W//2, 300 + i*24)))
+            screen.blit(s, s.get_rect(center=(W//2, 340 + i*24)))
 
-        # check for game start
-        if peer and peer.connected:
+        # ── check for game start message from relay ─────────────────────────
+        if peer:
             for msg in peer.poll():
                 if msg.get("type") == "start":
-                    return peer, msg["seed"], "guest", ai_armed
-            if mode == "host":
-                seed = random.randint(0, 10**9)
-                peer.send({"type": "start", "seed": seed})
-                return peer, seed, "host", ai_armed
+                    return peer, msg["seed"], msg["role"], ai_armed
+                if msg.get("type") == "opponent_disconnected":
+                    status = "Opponent disconnected."
+                    peer = None; mode = None; connecting = False
 
         pygame.display.flip()
 
@@ -418,9 +442,9 @@ def game_loop(screen, clock, fonts, peer, seed, role, ai_mode):
             pygame.quit(); sys.exit()
 
         # ── REMATCH handshake ───────────────────────────────────────────────
-        # Both press R -> both send want_rematch.
-        # Host waits to receive it, then sends new_round with new seed.
-        # Guest waits to receive new_round. Both then loop back to _round.
+        # Both press R → both send want_rematch through relay.
+        # Host receives it → picks new seed → sends new_round.
+        # Guest receives new_round → starts. Simple and clean.
         W, H = screen.get_size()
         peer.send({"type": "want_rematch"})
         they_want = False
@@ -429,10 +453,9 @@ def game_loop(screen, clock, fonts, peer, seed, role, ai_mode):
         while waiting:
             clock.tick(60)
             screen.fill(C_BG)
-            msg_text = "Waiting for opponent..." if not they_want else "Starting!"
-            t  = big.render("REMATCH?", True, C_YELLOW)
-            s  = small.render(msg_text, True, C_CYAN)
-            s2 = small.render("ESC - Lobby", True, (100,100,140))
+            t  = big.render("REMATCH", True, C_YELLOW)
+            s  = small.render("Waiting for opponent..." if not they_want else "Starting!", True, C_CYAN)
+            s2 = small.render("ESC  -  Lobby", True, (100,100,140))
             screen.blit(t,  t.get_rect(center=(W//2, H//2 - 60)))
             screen.blit(s,  s.get_rect(center=(W//2, H//2)))
             screen.blit(s2, s2.get_rect(center=(W//2, H//2 + 40)))
@@ -445,15 +468,19 @@ def game_loop(screen, clock, fonts, peer, seed, role, ai_mode):
                     peer.close(); return "lobby"
 
             for msg in peer.poll():
-                if msg.get("type") == "want_rematch":
+                t_msg = msg.get("type")
+                if t_msg == "want_rematch":
                     they_want = True
                     if role == "host":
+                        # host picks seed and sends immediately — no double wait
                         current_seed = random.randint(0, 10**9)
                         peer.send({"type": "new_round", "seed": current_seed})
                         waiting = False
-                elif msg.get("type") == "new_round":
+                elif t_msg == "new_round":
                     current_seed = msg["seed"]
                     waiting = False
+                elif t_msg == "opponent_disconnected":
+                    peer.close(); return "lobby"
 
             if not peer.connected:
                 return "lobby"
